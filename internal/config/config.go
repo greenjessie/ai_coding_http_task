@@ -1,8 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,9 +32,23 @@ type Config struct {
 		MaxAttempts  int           `json:"max_attempts"`
 	}
 
+	// RateLimit 速率限制配置
+	RateLimit struct {
+		Global struct {
+			QPS        int `json:"qps"`
+			MaxConns   int `json:"max_conns"`
+		}
+		PerPartner map[string]struct {
+			QPS      int `json:"qps"`
+			MaxConns int `json:"max_conns"`
+		} `json:"per_partner"`
+	}
+
 	// Security 安全配置
 	Security struct {
 		AllowedDomains []string `json:"allowed_domains"`
+		// 敏感头占位符映射，key是占位符，value是真实值（从环境变量或KMS获取）
+		SensitiveHeaders map[string]string `json:"sensitive_headers"`
 	}
 
 	// Log 日志配置
@@ -60,8 +76,44 @@ func Load() (*Config, error) {
 	cfg.Worker.PollInterval = time.Duration(getEnvAsInt("WORKER_POLL_INTERVAL", 5)) * time.Second
 	cfg.Worker.MaxAttempts = getEnvAsInt("WORKER_MAX_ATTEMPTS", 3)
 
-	cfg.Security.AllowedDomains = []string{"*"} // 默认允许所有域名
+	// 默认速率限制
+	cfg.RateLimit.Global.QPS = getEnvAsInt("RATE_LIMIT_QPS", 100)
+	cfg.RateLimit.Global.MaxConns = getEnvAsInt("RATE_LIMIT_MAX_CONNS", 50)
+	cfg.RateLimit.PerPartner = make(map[string]struct {
+		QPS      int `json:"qps"`
+		MaxConns int `json:"max_conns"`
+	})
+
+	// 安全配置
+	allowedDomains := getEnv("ALLOWED_DOMAINS", "*")
+	if allowedDomains == "*" {
+		cfg.Security.AllowedDomains = []string{"*"}
+	} else {
+		cfg.Security.AllowedDomains = strings.Split(allowedDomains, ",")
+	}
+
+	cfg.Security.SensitiveHeaders = make(map[string]string)
+	// 从环境变量加载敏感头
+	if authPlaceholder := getEnv("AUTH_PLACEHOLDER", ""); authPlaceholder != "" {
+		cfg.Security.SensitiveHeaders["{{AUTH_TOKEN}}"] = authPlaceholder
+	}
+
 	cfg.Log.Level = getEnv("LOG_LEVEL", "info")
+
+	// 尝试从配置文件加载
+	configFile := getEnv("CONFIG_FILE", "config.json")
+	if _, err := os.Stat(configFile); err == nil {
+		file, err := os.Open(configFile)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+
+		decoder := json.NewDecoder(file)
+		if err := decoder.Decode(cfg); err != nil {
+			return nil, err
+		}
+	}
 
 	return cfg, nil
 }

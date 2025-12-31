@@ -3,9 +3,13 @@ package httpapi
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
+	"api-notify/internal/config"
 	"api-notify/internal/core"
 	"api-notify/internal/store"
 	"api-notify/pkg/logging"
@@ -16,14 +20,16 @@ type Router struct {
 	mux    *http.ServeMux
 	store  *store.Store
 	logger *logging.Logger
+	config *config.Config
 }
 
 // NewRouter 创建一个新的路由器
-func NewRouter(store *store.Store, logger *logging.Logger) *Router {
+func NewRouter(store *store.Store, logger *logging.Logger, config *config.Config) *Router {
 	router := &Router{
 		mux:    http.NewServeMux(),
 		store:  store,
 		logger: logger,
+		config: config,
 	}
 
 	// 注册路由
@@ -285,19 +291,50 @@ func (r *Router) writeError(w http.ResponseWriter, status int, message string) {
 	})
 }
 
-// encodeHeaders 将headers编码为JSON字符串
+// encodeHeaders 将headers编码为JSON字符串，并替换敏感头为占位符
 func (r *Router) encodeHeaders(headers map[string]string) string {
 	if headers == nil {
 		return ""
 	}
 
-	data, err := json.Marshal(headers)
+	// 替换敏感头为占位符
+	sanitizedHeaders := make(map[string]string)
+	for k, v := range headers {
+		// 检查是否为敏感头
+		if isSensitiveHeader(k) {
+			// 生成占位符
+			placeholder := fmt.Sprintf("{{%s}}", strings.ToUpper(strings.ReplaceAll(k, "-", "_")))
+			sanitizedHeaders[k] = placeholder
+			// 保存占位符映射到配置（仅在开发环境，生产环境应该从KMS获取）
+			if r.config.Security.SensitiveHeaders == nil {
+				r.config.Security.SensitiveHeaders = make(map[string]string)
+			}
+			r.config.Security.SensitiveHeaders[placeholder] = v
+		} else {
+			sanitizedHeaders[k] = v
+		}
+	}
+
+	data, err := json.Marshal(sanitizedHeaders)
 	if err != nil {
 		r.logger.Error("Failed to encode headers: %v", err)
 		return ""
 	}
 
 	return string(data)
+}
+
+// isSensitiveHeader 检查是否为敏感头
+func isSensitiveHeader(key string) bool {
+	sensitiveHeaders := map[string]bool{
+		"Authorization": true,
+		"Cookie":        true,
+		"Set-Cookie":    true,
+		"X-Auth-Token":  true,
+		"Api-Key":       true,
+		"Token":         true,
+	}
+	return sensitiveHeaders[key]
 }
 
 // extractTaskID 从URL路径中提取任务ID
@@ -340,12 +377,62 @@ func (r *Router) generateRandomString(length int) string {
 	return string(result)
 }
 
-// isURLInWhitelist 检查目标URL是否在白名单域名内
-// 注意：当前为预留接口，实际实现应从配置中读取白名单
+// isURLInWhitelist 检查目标URL是否在白名单域名内，防止SSRF攻击
 func (r *Router) isURLInWhitelist(targetURL string) bool {
-	// 简化实现：暂时允许所有URL
-	// 实际实现应该：
-	// 1. 解析URL获取域名
-	// 2. 检查域名是否在配置的白名单中
-	return true
+	allowedDomains := r.config.Security.AllowedDomains
+
+	if len(allowedDomains) == 0 || (len(allowedDomains) == 1 && allowedDomains[0] == "*") {
+		return true
+	}
+
+	// 解析URL
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		r.logger.Error("Failed to parse URL %s: %v", targetURL, err)
+		return false
+	}
+
+	// 获取主机名
+	host := parsedURL.Host
+	// 如果有端口，去掉端口
+	if idx := strings.Index(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+
+	// 检查是否为内网/环回地址
+	if ip := net.ParseIP(host); ip != nil {
+		// 检查是否为环回地址
+		if ip.IsLoopback() {
+			r.logger.Warn("Loopback address rejected: %s", host)
+			return false
+		}
+		// 检查是否为内网地址
+		if ip.IsPrivate() {
+			r.logger.Warn("Private address rejected: %s", host)
+			return false
+		}
+		// 检查是否为IPv4/IPv6保留地址
+		if ip.IsUnspecified() || ip.IsLinkLocalMulticast() || ip.IsLinkLocalUnicast() {
+			r.logger.Warn("Reserved address rejected: %s", host)
+			return false
+		}
+		// 允许公网IP
+		return true
+	}
+
+	// 检查域名是否在白名单中
+	for _, domain := range allowedDomains {
+		// 支持通配符，如*.example.com
+		if strings.HasPrefix(domain, "*") {
+			suffix := domain[1:]
+			if strings.HasSuffix(host, suffix) {
+				return true
+			}
+		} else if host == domain {
+			return true
+		}
+	}
+
+	r.logger.Warn("Domain not in whitelist: %s", host)
+	return false
 }

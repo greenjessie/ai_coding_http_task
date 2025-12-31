@@ -1,0 +1,39 @@
+{
+  "Server": {
+    "Port": 8080,
+    "ReadTimeout": 10,
+    "WriteTimeout": 10
+  },
+  "Database": {
+    "DSN": "root:password@tcp(localhost:3306)/api_notify?charset=utf8mb4&parseTime=True&loc=Local",
+    "MaxOpenConns": 20,
+    "MaxIdleConns": 10,
+    "ConnMaxLifetime": 300
+  },
+  "Worker": {
+    "PollInterval": 5,
+    "MaxAttempts": 10,
+    "Concurrency": 5
+  },
+  "Security": {
+    "AllowedDomains": ["example.com", "*.example.org"],
+    "SensitiveHeaders": {
+      "Authorization": "Bearer your-secret-token",
+      "Api-Key": "your-api-key"
+    }
+  },
+  "RateLimit": {
+    "Global": {
+      "RequestsPerSecond": 100,
+      "Burst": 200
+    },
+    "PerPartner": {
+      "RequestsPerSecond": 10,
+      "Burst": 20
+    }
+  },
+  "Log": {
+    "Level": "info",
+    "Format": "text"
+  }
+}

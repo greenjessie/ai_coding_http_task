@@ -3,8 +3,10 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
+	"api-notify/internal/config"
 	"api-notify/internal/core"
 	"api-notify/internal/store"
 	"api-notify/pkg/httpclient"
@@ -19,41 +21,48 @@ type Worker struct {
 	logger    *logging.Logger
 	store     *store.Store
 	httpClient *httpclient.Client
-	config    WorkerConfig
+	config    *config.Config
 	stopCh    chan struct{}
-}
-
-// WorkerConfig Worker配置
-
-type WorkerConfig struct {
-	Interval       time.Duration // 轮询间隔
-	BatchSize      int           // 每次处理的批次大小
-	MaxRetries     int           // 最大重试次数
-	RetryBackoff   time.Duration // 重试间隔基数
-	ConcurrentWorkers int        // 并发Worker数量
+	// Sub-struct for configuration
+	settings struct {
+		ConcurrentWorkers int
+		Interval          time.Duration
+		BatchSize         int
+		RetryBackoff      time.Duration
+		SensitiveHeaders  map[string]string
+	}
 }
 
 // NewWorker 创建新的Worker实例
 
-func NewWorker(logger *logging.Logger, store *store.Store, httpClient *httpclient.Client, config WorkerConfig) *Worker {
-	return &Worker{
+func NewWorker(logger *logging.Logger, store *store.Store, httpClient *httpclient.Client, config *config.Config) *Worker {
+	worker := &Worker{
 		logger:     logger,
 		store:      store,
 		httpClient: httpClient,
 		config:     config,
 		stopCh:     make(chan struct{}),
 	}
+	
+	// Populate configuration sub-struct
+	worker.settings.ConcurrentWorkers = config.Worker.Concurrency
+	worker.settings.Interval = config.Worker.PollInterval
+	worker.settings.BatchSize = 100 // Default batch size
+	worker.settings.RetryBackoff = 5 * time.Second // Default retry backoff
+	worker.settings.SensitiveHeaders = config.Security.SensitiveHeaders
+	
+	return worker
 }
 
 // Start 启动Worker
 
 func (w *Worker) Start(ctx context.Context) {
 	// 创建指定数量的并发Worker
-	for i := 0; i < w.config.ConcurrentWorkers; i++ {
+	for i := 0; i < w.settings.ConcurrentWorkers; i++ {
 		go w.runWorker(ctx, i)
 	}
 	
-	w.logger.Info("Dispatcher workers started with %d concurrent workers", w.config.ConcurrentWorkers)
+	w.logger.Info("Dispatcher workers started with %d concurrent workers", w.settings.ConcurrentWorkers)
 }
 
 // Stop 停止Worker
@@ -69,7 +78,7 @@ func (w *Worker) runWorker(ctx context.Context, id int) {
 	w.logger.Debug("Worker %d started", id)
 	defer w.logger.Debug("Worker %d stopped", id)
 
-	ticker := time.NewTicker(w.config.Interval)
+	ticker := time.NewTicker(w.settings.Interval)
 	defer ticker.Stop()
 
 	for {
@@ -88,7 +97,7 @@ func (w *Worker) runWorker(ctx context.Context, id int) {
 
 func (w *Worker) processTasks(ctx context.Context) {
 	// 获取待处理的任务
-	tasks, err := w.store.GetPendingTasks(ctx, w.config.BatchSize)
+	tasks, err := w.store.GetPendingTasks(ctx, w.settings.BatchSize)
 	if err != nil {
 		w.logger.Error("Failed to get pending tasks: %v", err)
 		return
@@ -164,7 +173,7 @@ func (w *Worker) processTask(ctx context.Context, task *core.NotificationTask) {
 	// 发送失败，处理重试逻辑
 	if attemptCount+1 < task.MaxAttempts {
 		// 计算下次重试时间（指数退避 + 抖动）
-		nextAttemptAt := calculateNextAttempt(attemptCount, w.config.RetryBackoff)
+		nextAttemptAt := calculateNextAttempt(attemptCount, w.settings.RetryBackoff)
 		// 更新任务状态为failed，设置下次尝试时间
 		if err := w.store.UpdateTaskRetry(ctx, task.TaskID, attemptCount+1, nextAttemptAt); err != nil {
 			w.logger.Error("Failed to update task retry for task %s: %v", task.TaskID, err)
@@ -192,6 +201,23 @@ func (w *Worker) sendNotification(ctx context.Context, task *core.NotificationTa
 		}
 	} else {
 		headers = make(map[string]string)
+	}
+
+	// 替换敏感头占位符
+	for key, value := range headers {
+		// 检查是否是敏感头占位符格式 {{HEADER_NAME}}
+		if strings.HasPrefix(value, "{{") && strings.HasSuffix(value, "}}") {
+			headerName := strings.TrimSpace(value[2 : len(value)-2])
+			// 从配置中获取真实的敏感头值
+			if realValue, exists := w.settings.SensitiveHeaders[headerName]; exists {
+				headers[key] = realValue
+				w.logger.Debug("Replaced sensitive header placeholder for task %s: %s", task.TaskID, key)
+			} else {
+				w.logger.Warn("Sensitive header placeholder not found in config for task %s: %s", task.TaskID, headerName)
+				// 如果没有找到真实值，可以考虑移除这个头或者保留占位符
+				// 这里我们选择保留占位符
+			}
+		}
 	}
 
 	// 创建HTTP请求
