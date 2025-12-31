@@ -108,7 +108,6 @@ func (w *Worker) processTasks(ctx context.Context) {
 }
 
 // processTask 处理单个任务
-
 func (w *Worker) processTask(ctx context.Context, task *core.NotificationTask) {
 	// 获取当前尝试次数
 	attemptCount, err := w.store.GetAttemptCount(ctx, task.TaskID)
@@ -125,17 +124,25 @@ func (w *Worker) processTask(ctx context.Context, task *core.NotificationTask) {
 		CreatedAt:  time.Now(),
 	}
 
-	// 发送通知
+	// 发送通知并记录延迟
+	startTime := time.Now()
 	success, responseCode, _, err := w.sendNotification(ctx, task) // 使用 _ 忽略 responseBody
+	latency := time.Since(startTime)
+
 	if err != nil {
 		w.logger.Error("Failed to send notification for task %s: %v", task.TaskID, err)
 		attempt.ErrorMessage = err.Error()
+		// 设置通用错误码
+		attempt.ErrorCode = "HTTP_REQUEST_FAILED"
+		if err.Error() == "context deadline exceeded" {
+			attempt.ErrorCode = "HTTP_REQUEST_TIMEOUT"
+		}
 	}
 
 	// 更新尝试记录
 	attempt.Status = core.AttemptStatusSent
 	attempt.HTTPStatusCode = responseCode
-	attempt.LatencyMs = 0 // 这里可以根据实际情况设置延迟时间
+	attempt.LatencyMs = latency.Milliseconds()
 
 	// 记录尝试
 	if err := w.store.RecordAttempt(ctx, attempt); err != nil {
@@ -150,32 +157,31 @@ func (w *Worker) processTask(ctx context.Context, task *core.NotificationTask) {
 			w.logger.Error("Failed to update task status to completed for task %s: %v", task.TaskID, err)
 			return
 		}
-		w.logger.Info("Notification sent successfully for task %s", task.TaskID)
+		w.logger.Info("Notification sent successfully for task %s, status code: %d, latency: %dms", task.TaskID, responseCode, attempt.LatencyMs)
 		return
 	}
 
 	// 发送失败，处理重试逻辑
-	if task.AttemptCount < w.config.MaxRetries {
-		// 计算下次重试时间（指数退避）
-		nextAttemptAt := calculateNextAttempt(task.AttemptCount, w.config.RetryBackoff)
-		// 更新任务状态为待重试
-		if err := w.store.UpdateTaskRetry(ctx, task.TaskID, task.AttemptCount+1, nextAttemptAt); err != nil {
+	if attemptCount+1 < task.MaxAttempts {
+		// 计算下次重试时间（指数退避 + 抖动）
+		nextAttemptAt := calculateNextAttempt(attemptCount, w.config.RetryBackoff)
+		// 更新任务状态为failed，设置下次尝试时间
+		if err := w.store.UpdateTaskRetry(ctx, task.TaskID, attemptCount+1, nextAttemptAt); err != nil {
 			w.logger.Error("Failed to update task retry for task %s: %v", task.TaskID, err)
 			return
 		}
-		w.logger.Info("Notification failed for task %s, will retry at %s", task.TaskID, nextAttemptAt.Format(time.RFC3339))
+		w.logger.Info("Notification failed for task %s, will retry at %s (attempt %d/%d)", task.TaskID, nextAttemptAt.Format(time.RFC3339), attemptCount+1, task.MaxAttempts)
 	} else {
-		// 达到最大重试次数，更新任务状态为失败
-		if err := w.store.UpdateTaskStatus(ctx, task.TaskID, core.TaskStatusFailed, time.Now()); err != nil {
-			w.logger.Error("Failed to update task status to failed for task %s: %v", task.TaskID, err)
+		// 达到最大重试次数，更新任务状态为dead
+		if err := w.store.UpdateTaskStatus(ctx, task.TaskID, core.TaskStatusDead, time.Now()); err != nil {
+			w.logger.Error("Failed to update task status to dead for task %s: %v", task.TaskID, err)
 			return
 		}
-		w.logger.Info("Notification failed for task %s after %d attempts, marked as failed", task.TaskID, w.config.MaxRetries)
+		w.logger.Info("Notification failed for task %s after %d attempts, marked as dead", task.TaskID, task.MaxAttempts)
 	}
 }
 
 // sendNotification 发送单个通知
-
 func (w *Worker) sendNotification(ctx context.Context, task *core.NotificationTask) (bool, int, string, error) {
 	// 解析请求头
 	var headers map[string]string
@@ -194,20 +200,83 @@ func (w *Worker) sendNotification(ctx context.Context, task *core.NotificationTa
 		return false, 0, "", err
 	}
 
+	// 记录日志（脱敏与截断）
+	w.logHTTPRequest(task, headers)
+
 	// 根据响应码判断是否成功
-	// 通常2xx表示成功
-	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+	// 默认规则：2xx/3xx成功，其他错误或网络超时算失败
+	// 429特殊处理（预留重试逻辑）
+	success := false
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		success = true
+	} else if resp.StatusCode == 429 {
+		// 429 Too Many Requests，特殊处理：需要重试
+		success = false
+	} else {
+		// 其他状态码视为失败
+		success = false
+	}
+
 	return success, resp.StatusCode, string(resp.Body), nil
 }
 
-// calculateNextAttempt 计算下次重试时间
-// 使用指数退避策略
+// logHTTPRequest 记录HTTP请求日志（脱敏与截断）
+func (w *Worker) logHTTPRequest(task *core.NotificationTask, headers map[string]string) {
+	// 截断请求体（最长100字符）
+	bodyLog := task.Body
+	if len(bodyLog) > 100 {
+		bodyLog = bodyLog[:100] + "..."
+	}
 
+	// 脱敏敏感头
+	sanitizedHeaders := make(map[string]string)
+	for k, v := range headers {
+		if isSensitiveHeader(k) {
+			sanitizedHeaders[k] = "[REDACTED]"
+		} else {
+			sanitizedHeaders[k] = v
+		}
+	}
+
+	// 记录日志
+	w.logger.Debug("Sending HTTP request for task %s: method=%s, url=%s, headers=%v, body=%s",
+		task.TaskID, task.HTTPMethod, task.TargetURL, sanitizedHeaders, bodyLog)
+}
+
+// isSensitiveHeader 检查是否为敏感头
+func isSensitiveHeader(key string) bool {
+	sensitiveHeaders := map[string]bool{
+		"Authorization": true,
+		"Cookie":        true,
+		"Set-Cookie":    true,
+		"X-Auth-Token":  true,
+		"Api-Key":       true,
+		"Token":         true,
+	}
+	return sensitiveHeaders[key]
+}
+
+// calculateNextAttempt 计算下次重试时间
+// 使用指数退避 + 抖动策略
 func calculateNextAttempt(attemptCount int, baseBackoff time.Duration) time.Time {
 	// 指数退避: baseBackoff * (2^attemptCount)
 	backoff := baseBackoff
 	for i := 0; i < attemptCount; i++ {
 		backoff *= 2
+		// 限制最大退避时间（防止无限增长）
+		if backoff > 24*time.Hour {
+			backoff = 24 * time.Hour
+			break
+		}
 	}
+
+	// 添加抖动（±10%）
+	jitter := backoff / 10
+	if jitter > 0 {
+		// 生成随机抖动值
+		randomJitter := time.Duration((int64(time.Now().UnixNano()) % int64(jitter*2)) - int64(jitter))
+		backoff += randomJitter
+	}
+
 	return time.Now().Add(backoff)
 }

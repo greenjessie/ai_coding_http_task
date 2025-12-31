@@ -159,23 +159,46 @@ func (s *Store) GetTaskByIdempotencyKey(ctx context.Context, idempotencyKey, par
 	return &task, nil
 }
 
-// GetPendingTasks 获取待处理的任务
+// GetPendingTasks 获取待处理的任务（带行级锁避免重复消费）
 func (s *Store) GetPendingTasks(ctx context.Context, limit int) ([]*core.NotificationTask, error) {
+	// 使用MySQL行级锁，将状态更新为running并锁定行
 	query := `
+	UPDATE notification_tasks 
+	SET status = ? 
+	WHERE status IN (?, ?, ?) AND next_attempt_at <= NOW()
+	ORDER BY priority DESC, next_attempt_at ASC
+	LIMIT ?
+	`
+
+	// 先将任务状态更新为running
+	_, err := s.db.ExecContext(
+		ctx,
+		query,
+		core.TaskStatusRunning,
+		core.TaskStatusPending,
+		core.TaskStatusFailed,
+		core.TaskStatusRunning, // 包含running状态以处理可能的中断恢复
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update task status to running: %w", err)
+	}
+
+	// 再查询已锁定的任务
+	selectQuery := `
 	SELECT 
 		id, task_id, partner_id, target_url, http_method, headers, body, 
 		idempotency_key, priority, status, next_attempt_at, max_attempts, success_condition,
 		created_at, updated_at
 	FROM notification_tasks 
-	WHERE status IN (?, ?) AND next_attempt_at <= NOW()
+	WHERE status = ?
 	ORDER BY priority DESC, next_attempt_at ASC
 	LIMIT ?
 	`
 
 	rows, err := s.db.QueryContext(
 		ctx,
-		query,
-		core.TaskStatusPending,
+		selectQuery,
 		core.TaskStatusRunning,
 		limit,
 	)
