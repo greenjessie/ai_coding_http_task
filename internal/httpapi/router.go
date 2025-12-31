@@ -65,34 +65,63 @@ func (r *Router) handleCreateNotification(w http.ResponseWriter, req *http.Reque
 		return
 	}
 
+	// 检查目标URL是否在白名单域名内
+	if !r.isURLInWhitelist(reqBody.TargetURL) {
+		r.writeError(w, http.StatusForbidden, "Target URL is not in whitelist")
+		return
+	}
+
+	// 处理幂等性键
+	idempotencyKey := reqBody.IdempotencyKey
+	if idempotencyKey == "" {
+		idempotencyKey = req.Header.Get("Idempotency-Key")
+	}
+
+	// 幂等性校验
+	if idempotencyKey != "" {
+		// 检查是否已存在相同的幂等键和partner_id的任务
+		existingTask, err := r.store.GetTaskByIdempotencyKey(req.Context(), idempotencyKey, reqBody.PartnerID)
+		if err != nil {
+			r.logger.Error("Failed to check idempotency: %v", err)
+			r.writeError(w, http.StatusInternalServerError, "Failed to create notification")
+			return
+		}
+		if existingTask != nil {
+			// 返回已存在的任务ID
+			r.writeJSON(w, http.StatusOK, CreateNotificationResponse{
+				TaskID: existingTask.TaskID,
+				Status: string(existingTask.Status),
+			})
+			return
+		}
+	}
+
 	// 设置默认值
-	httpMethod := reqBody.HTTPMethod
+	httpMethod := reqBody.Method
 	if httpMethod == "" {
 		httpMethod = "POST"
 	}
 
-	maxAttempts := reqBody.MaxAttempts
-	if maxAttempts == 0 {
-		maxAttempts = 3
-	}
+	maxAttempts := 3 // 默认最大尝试次数
 
 	// 生成任务ID
 	taskID := fmt.Sprintf("task_%d_%s", time.Now().UnixNano(), r.generateRandomString(8))
 
 	// 创建任务
 	task := &core.NotificationTask{
-		TaskID:         taskID,
-		PartnerID:      reqBody.PartnerID,
-		TargetURL:      reqBody.TargetURL,
-		HTTPMethod:     httpMethod,
-		Headers:        r.encodeHeaders(reqBody.Headers),
-		Body:           reqBody.Body,
-		IdempotencyKey: reqBody.IdempotencyKey,
-		Priority:       reqBody.Priority,
-		Status:         core.TaskStatusPending,
-		NextAttemptAt:  time.Now(),
-		MaxAttempts:    maxAttempts,
-		SuccessCondition: reqBody.SuccessCondition,
+		TaskID:             taskID,
+		PartnerID:          reqBody.PartnerID,
+		TargetURL:          reqBody.TargetURL,
+		HTTPMethod:         httpMethod,
+		Headers:            r.encodeHeaders(reqBody.Headers),
+		Body:               string(reqBody.Body),
+		IdempotencyKey:     idempotencyKey,
+		Priority:           reqBody.Priority,
+		Status:             core.TaskStatusPending,
+		NextAttemptAt:      time.Now(),
+		MaxAttempts:        maxAttempts,
+		AttemptCount:       0,
+		SuccessCondition:   reqBody.SuccessCondition,
 	}
 
 	// 保存任务到数据库
@@ -105,6 +134,7 @@ func (r *Router) handleCreateNotification(w http.ResponseWriter, req *http.Reque
 	// 返回响应
 	r.writeJSON(w, http.StatusCreated, CreateNotificationResponse{
 		TaskID: taskID,
+		Status: string(task.Status),
 	})
 }
 
@@ -145,40 +175,84 @@ func (r *Router) handleGetNotification(w http.ResponseWriter, req *http.Request,
 		return
 	}
 
-	// 获取尝试次数
-	attemptCount, err := r.store.GetAttemptCount(req.Context(), taskID)
+	// 获取所有尝试记录
+	attempts, err := r.store.GetAttemptsByTaskID(req.Context(), taskID)
 	if err != nil {
-		r.logger.Error("Failed to get attempt count: %v", err)
+		r.logger.Error("Failed to get attempts: %v", err)
 		r.writeError(w, http.StatusInternalServerError, "Failed to get notification")
 		return
 	}
 
-	// 返回响应
-	r.writeJSON(w, http.StatusOK, GetNotificationResponse{
+	// 准备响应
+	resp := GetNotificationResponse{
 		TaskID:         task.TaskID,
 		PartnerID:      task.PartnerID,
 		TargetURL:      task.TargetURL,
-		HTTPMethod:     task.HTTPMethod,
+		Method:         task.HTTPMethod,
 		Status:         string(task.Status),
-		NextAttemptAt:  task.NextAttemptAt.Format(time.RFC3339),
 		MaxAttempts:    task.MaxAttempts,
-		AttemptCount:   attemptCount,
+		AttemptCount:   len(attempts),
 		CreatedAt:      task.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:      task.UpdatedAt.Format(time.RFC3339),
-	})
+	}
+
+	// 设置下次尝试时间（仅当任务处于非终态时）
+	if task.Status == core.TaskStatusPending || task.Status == core.TaskStatusRunning {
+		resp.NextAttemptAt = task.NextAttemptAt.Format(time.RFC3339)
+	}
+
+	// 设置最近一次尝试摘要（如果有尝试记录）
+	if len(attempts) > 0 {
+		// 获取最后一次尝试记录
+		lastAttempt := attempts[len(attempts)-1]
+		
+		resp.LastAttemptSummary = &LastAttemptSummary{
+			AttemptNo:      lastAttempt.AttemptNo,
+			HTTPStatusCode: lastAttempt.HTTPStatusCode,
+			ErrorCode:      lastAttempt.ErrorCode,
+			ErrorMessage:   lastAttempt.ErrorMessage,
+			LatencyMs:      lastAttempt.LatencyMs,
+			CreatedAt:      lastAttempt.CreatedAt.Format(time.RFC3339),
+		}
+	}
+
+	// 返回响应
+	r.writeJSON(w, http.StatusOK, resp)
 }
 
 // handleCancelNotification 处理取消通知请求
 func (r *Router) handleCancelNotification(w http.ResponseWriter, req *http.Request, taskID string) {
-	// 更新任务状态为已取消
-	if err := r.store.UpdateTaskStatus(req.Context(), taskID, core.TaskStatusCancelled, time.Now()); err != nil {
+	// 查询任务
+	task, err := r.store.GetTaskByTaskID(req.Context(), taskID)
+	if err != nil {
+		r.logger.Error("Failed to get task: %v", err)
+		r.writeError(w, http.StatusInternalServerError, "Failed to cancel notification")
+		return
+	}
+
+	if task == nil {
+		r.writeError(w, http.StatusNotFound, "Notification not found")
+		return
+	}
+
+	// 检查任务是否处于非终态
+	if task.Status != core.TaskStatusPending && task.Status != core.TaskStatusRunning {
+		r.writeError(w, http.StatusBadRequest, "Cannot cancel a task in terminal state")
+		return
+	}
+
+	// 更新任务状态为dead
+	if err := r.store.UpdateTaskStatus(req.Context(), taskID, core.TaskStatusDead, time.Now()); err != nil {
 		r.logger.Error("Failed to cancel task: %v", err)
 		r.writeError(w, http.StatusInternalServerError, "Failed to cancel notification")
 		return
 	}
 
-	// 返回成功响应
-	w.WriteHeader(http.StatusOK)
+	// 返回响应
+	r.writeJSON(w, http.StatusOK, CancelNotificationResponse{
+		TaskID: taskID,
+		Status: string(core.TaskStatusDead),
+	})
 }
 
 // extractTaskIDAndAction 从URL路径中提取任务ID和操作
@@ -264,4 +338,14 @@ func (r *Router) generateRandomString(length int) string {
 		result[i] = charset[int(time.Now().UnixNano())%len(charset)]
 	}
 	return string(result)
+}
+
+// isURLInWhitelist 检查目标URL是否在白名单域名内
+// 注意：当前为预留接口，实际实现应从配置中读取白名单
+func (r *Router) isURLInWhitelist(targetURL string) bool {
+	// 简化实现：暂时允许所有URL
+	// 实际实现应该：
+	// 1. 解析URL获取域名
+	// 2. 检查域名是否在配置的白名单中
+	return true
 }

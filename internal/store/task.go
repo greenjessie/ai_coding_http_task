@@ -120,6 +120,45 @@ func (s *Store) GetTaskByTaskID(ctx context.Context, taskID string) (*core.Notif
 	return &task, nil
 }
 
+// GetTaskByIdempotencyKey 根据幂等键和partner_id查询任务
+func (s *Store) GetTaskByIdempotencyKey(ctx context.Context, idempotencyKey, partnerID string) (*core.NotificationTask, error) {
+	query := `
+	SELECT 
+		id, task_id, partner_id, target_url, http_method, headers, body, 
+		idempotency_key, priority, status, next_attempt_at, max_attempts, success_condition,
+		created_at, updated_at
+	FROM notification_tasks WHERE idempotency_key = ? AND partner_id = ?
+	`
+
+	var task core.NotificationTask
+	err := s.db.QueryRowContext(ctx, query, idempotencyKey, partnerID).Scan(
+		&task.ID,
+		&task.TaskID,
+		&task.PartnerID,
+		&task.TargetURL,
+		&task.HTTPMethod,
+		&task.Headers,
+		&task.Body,
+		&task.IdempotencyKey,
+		&task.Priority,
+		&task.Status,
+		&task.NextAttemptAt,
+		&task.MaxAttempts,
+		&task.SuccessCondition,
+		&task.CreatedAt,
+		&task.UpdatedAt,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get task by idempotency key: %w", err)
+	}
+
+	return &task, nil
+}
+
 // GetPendingTasks 获取待处理的任务
 func (s *Store) GetPendingTasks(ctx context.Context, limit int) ([]*core.NotificationTask, error) {
 	query := `
@@ -197,7 +236,7 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, taskID string, status core
 func (s *Store) RecordAttempt(ctx context.Context, attempt *core.NotificationAttempt) error {
 	query := `
 	INSERT INTO notification_attempts (
-		task_id, partner_id, status, response_code, response_body, error_message, created_at, updated_at
+		task_id, attempt_no, status, http_status_code, error_code, error_message, latency_ms, created_at
 	) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
@@ -205,13 +244,13 @@ func (s *Store) RecordAttempt(ctx context.Context, attempt *core.NotificationAtt
 		ctx,
 		query,
 		attempt.TaskID,
-		attempt.PartnerID,
+		attempt.AttemptNo,
 		attempt.Status,
-		attempt.ResponseCode,
-		attempt.ResponseBody,
+		attempt.HTTPStatusCode,
+		attempt.ErrorCode,
 		attempt.ErrorMessage,
+		attempt.LatencyMs,
 		attempt.CreatedAt,
-		attempt.UpdatedAt,
 	)
 
 	if err != nil {
@@ -232,6 +271,48 @@ func (s *Store) GetAttemptCount(ctx context.Context, taskID string) (int, error)
 	}
 
 	return count, nil
+}
+
+// GetAttemptsByTaskID 根据TaskID获取所有尝试记录
+func (s *Store) GetAttemptsByTaskID(ctx context.Context, taskID string) ([]*core.NotificationAttempt, error) {
+	query := `
+	SELECT 
+		id, task_id, attempt_no, status, http_status_code, error_code, error_message, latency_ms, created_at
+	FROM notification_attempts 
+	WHERE task_id = ? 
+	ORDER BY created_at ASC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get attempts by task_id: %w", err)
+	}
+	defer rows.Close()
+
+	attempts := make([]*core.NotificationAttempt, 0)
+	for rows.Next() {
+		var attempt core.NotificationAttempt
+		if err := rows.Scan(
+			&attempt.ID,
+			&attempt.TaskID,
+			&attempt.AttemptNo,
+			&attempt.Status,
+			&attempt.HTTPStatusCode,
+			&attempt.ErrorCode,
+			&attempt.ErrorMessage,
+			&attempt.LatencyMs,
+			&attempt.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan attempt: %w", err)
+		}
+		attempts = append(attempts, &attempt)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+
+	return attempts, nil
 }
 
 // UpdateTaskRetry 更新任务重试信息

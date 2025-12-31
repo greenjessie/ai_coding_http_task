@@ -10,29 +10,29 @@ import (
 type Config struct {
 	// Server 服务器配置
 	Server struct {
-		Port        int           `json:"port"`
-		ReadTimeout time.Duration `json:"read_timeout"`
+		Port         int           `json:"port"`
+		ReadTimeout  time.Duration `json:"read_timeout"`
 		WriteTimeout time.Duration `json:"write_timeout"`
 	}
 
 	// Database 数据库配置
 	Database struct {
-		DSN          string        `json:"dsn"`
-		MaxIdleConns int           `json:"max_idle_conns"`
-		MaxOpenConns int           `json:"max_open_conns"`
+		DSN             string        `json:"dsn"`
+		MaxIdleConns    int           `json:"max_idle_conns"`
+		MaxOpenConns    int           `json:"max_open_conns"`
 		ConnMaxLifetime time.Duration `json:"conn_max_lifetime"`
 	}
 
 	// Worker Worker配置
 	Worker struct {
-		Concurrency   int           `json:"concurrency"`
-		PollInterval  time.Duration `json:"poll_interval"`
-		MaxAttempts   int           `json:"max_attempts"`
+		Concurrency  int           `json:"concurrency"`
+		PollInterval time.Duration `json:"poll_interval"`
+		MaxAttempts  int           `json:"max_attempts"`
 	}
 
 	// Security 安全配置
 	Security struct {
-		AllowedDomains []string     `json:"allowed_domains"`
+		AllowedDomains []string `json:"allowed_domains"`
 	}
 
 	// Log 日志配置
@@ -50,7 +50,8 @@ func Load() (*Config, error) {
 	cfg.Server.ReadTimeout = 10 * time.Second
 	cfg.Server.WriteTimeout = 10 * time.Second
 
-	cfg.Database.DSN = getEnv("DB_DSN", "root:password@tcp(127.0.0.1:3306)/api_notify?charset=utf8mb4&parseTime=True&loc=Local")
+	// test db config
+	cfg.Database.DSN = getEnv("DB_DSN", "api_user:kn0*^KMO@OFoJN123@tcp(8.131.76.158:3306)/api_notify?charset=utf8mb4&parseTime=True&loc=Local")
 	cfg.Database.MaxIdleConns = getEnvAsInt("DB_MAX_IDLE_CONNS", 10)
 	cfg.Database.MaxOpenConns = getEnvAsInt("DB_MAX_OPEN_CONNS", 100)
 	cfg.Database.ConnMaxLifetime = 30 * time.Minute

@@ -40,13 +40,13 @@ const (
 type NotificationAttempt struct {
 	ID            uint64        `json:"id"`
 	TaskID        string        `json:"task_id"` // 外键，关联 notification_tasks.task_id
-	PartnerID     string        `json:"partner_id"`
+	AttemptNo     int           `json:"attempt_no"` // 尝试次数
 	Status        AttemptStatus `json:"status"`
-	ResponseCode  int           `json:"response_code"`
-	ResponseBody  string        `json:"response_body"`
-	ErrorMessage  string        `json:"error_message"`
+	HTTPStatusCode int          `json:"http_status_code"` // HTTP响应状态码
+	ErrorCode     string        `json:"error_code"` // 错误代码
+	ErrorMessage  string        `json:"error_message"` // 错误信息
+	LatencyMs     int64         `json:"latency_ms"` // 延迟时间（毫秒）
 	CreatedAt     time.Time     `json:"created_at"`
-	UpdatedAt     time.Time     `json:"updated_at"`
 }
 
 // NotificationTask 通知任务实体

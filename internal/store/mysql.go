@@ -78,8 +78,8 @@ func initTables(db *sql.DB, logger *logging.Logger) error {
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 		INDEX idx_partner_id (partner_id),
-		INDEX idx_status (status),
-		INDEX idx_next_attempt_at (next_attempt_at)
+		INDEX idx_status_next_attempt (status, next_attempt_at),
+		INDEX idx_idempotency_partner (idempotency_key, partner_id)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 	`
 
@@ -92,13 +92,14 @@ func initTables(db *sql.DB, logger *logging.Logger) error {
 	CREATE TABLE IF NOT EXISTS notification_attempts (
 		id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
 		task_id VARCHAR(64) NOT NULL,
-		attempt_number INT NOT NULL,
-		status_code INT NOT NULL DEFAULT 0,
-		latency_ms BIGINT NOT NULL DEFAULT 0,
+		attempt_no INT NOT NULL,
+		status VARCHAR(16) NOT NULL DEFAULT 'pending',
+		http_status_code INT NOT NULL DEFAULT 0,
+		error_code VARCHAR(64),
 		error_message TEXT,
+		latency_ms BIGINT NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		INDEX idx_task_id (task_id),
-		INDEX idx_created_at (created_at)
+		INDEX idx_task_id (task_id)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 	`
 

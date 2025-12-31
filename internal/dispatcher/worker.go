@@ -110,17 +110,23 @@ func (w *Worker) processTasks(ctx context.Context) {
 // processTask 处理单个任务
 
 func (w *Worker) processTask(ctx context.Context, task *core.NotificationTask) {
+	// 获取当前尝试次数
+	attemptCount, err := w.store.GetAttemptCount(ctx, task.TaskID)
+	if err != nil {
+		w.logger.Error("Failed to get attempt count for task %s: %v", task.TaskID, err)
+		return
+	}
+
 	// 记录尝试
 	attempt := &core.NotificationAttempt{
 		TaskID:     task.TaskID, // 使用task.TaskID而不是task.ID
-		PartnerID:  task.PartnerID,
+		AttemptNo:  attemptCount + 1, // 尝试次数自增
 		Status:     core.AttemptStatusPending,
 		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
 	}
 
 	// 发送通知
-	success, responseCode, responseBody, err := w.sendNotification(ctx, task)
+	success, responseCode, _, err := w.sendNotification(ctx, task) // 使用 _ 忽略 responseBody
 	if err != nil {
 		w.logger.Error("Failed to send notification for task %s: %v", task.TaskID, err)
 		attempt.ErrorMessage = err.Error()
@@ -128,9 +134,8 @@ func (w *Worker) processTask(ctx context.Context, task *core.NotificationTask) {
 
 	// 更新尝试记录
 	attempt.Status = core.AttemptStatusSent
-	attempt.ResponseCode = responseCode
-	attempt.ResponseBody = responseBody
-	attempt.UpdatedAt = time.Now()
+	attempt.HTTPStatusCode = responseCode
+	attempt.LatencyMs = 0 // 这里可以根据实际情况设置延迟时间
 
 	// 记录尝试
 	if err := w.store.RecordAttempt(ctx, attempt); err != nil {
