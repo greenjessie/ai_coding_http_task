@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -20,6 +21,10 @@ import (
 )
 
 func main() {
+	// 解析命令行参数
+	migrateCmd := flag.Bool("migrate", false, "Run database migrations and exit")
+	flag.Parse()
+
 	// 1. 初始化日志
 	logger := logging.New("info")
 	logger.Info("Starting API notification service...")
@@ -40,6 +45,13 @@ func main() {
 	}
 	defer store.Close()
 	logger.Info("Database initialized successfully")
+
+	// 如果是迁移命令，执行迁移后退出
+	if *migrateCmd {
+		logger.Info("Database migration completed successfully")
+		fmt.Println("Database migration completed successfully")
+		return
+	}
 
 	// 4. 初始化HTTP客户端
 	httpClient := httpclient.New(logger)

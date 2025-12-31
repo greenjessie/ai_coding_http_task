@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  # MySQL 数据库服务
+  mysql:
+    image: mysql:8.0
+    container_name: api-notify-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: api_notify
+      MYSQL_USER: api_notify_user
+      MYSQL_PASSWORD: api_notify_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - api-notify-network
+
+  # API-Notify 服务
+  api-notify:
+    build: .
+    container_name: api-notify-service
+    restart: always
+    depends_on:
+      - mysql
+    environment:
+      - CONFIG_FILE=/app/config.json
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.json:/app/config.json
+    networks:
+      - api-notify-network
+
+volumes:
+  mysql_data:
+
+networks:
+  api-notify-network:
+    driver: bridge
